@@ -1,13 +1,16 @@
 import argparse
 import os
 import sys
+import threading
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
 
 TIMEOUT = 15
 PER_PAGE = 100
+DEFAULT_CONCURRENCY = 10
 
 
 def get_config_dir() -> Path:
@@ -235,7 +238,7 @@ def run_cleanup() -> None:
         print(t("no_follow"))
 
 
-def run_discover(min_overlap: int, max_follows: int, dry_run: bool) -> None:
+def run_discover(min_overlap: int, max_follows: int, dry_run: bool, concurrency: int) -> None:
     print(t("fetching_following"))
     my_following_raw = get_all_users("following")
     my_following = {u["login"] for u in my_following_raw}
@@ -248,14 +251,28 @@ def run_discover(min_overlap: int, max_follows: int, dry_run: bool) -> None:
     if not check_rate_limit(estimated):
         return
 
-    print(t("scanning", n=len(my_following)))
+    users_list = sorted(my_following)
+    total = len(users_list)
+    print(t("scanning", n=total))
+
     counter: Counter[str] = Counter()
-    for i, user in enumerate(sorted(my_following), 1):
-        print(t("scanning_user", i=i, total=len(my_following), user=user), flush=True)
-        for name in get_user_following(user):
-            if name == my_username or name in my_following or name in blacklist:
-                continue
-            counter[name] += 1
+    lock = threading.Lock()
+    completed = 0
+
+    def fetch(user: str) -> tuple[str, list[str]]:
+        return user, get_user_following(user)
+
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        futures = [pool.submit(fetch, u) for u in users_list]
+        for future in as_completed(futures):
+            user, names = future.result()
+            with lock:
+                completed += 1
+                print(t("scanning_user", i=completed, total=total, user=user), flush=True)
+                for name in names:
+                    if name == my_username or name in my_following or name in blacklist:
+                        continue
+                    counter[name] += 1
 
     candidates = [(name, count) for name, count in counter.most_common() if count >= min_overlap]
 
@@ -293,11 +310,12 @@ def main() -> None:
     disc.add_argument("--min-overlap", type=int, default=2)
     disc.add_argument("--max-follows", type=int, default=20)
     disc.add_argument("--dry-run", action="store_true")
+    disc.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
 
     args = parser.parse_args()
 
     if args.cmd == "discover":
-        run_discover(args.min_overlap, args.max_follows, args.dry_run)
+        run_discover(args.min_overlap, args.max_follows, args.dry_run, args.concurrency)
     else:
         run_cleanup()
 
