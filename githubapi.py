@@ -1,7 +1,9 @@
 import argparse
 import os
+import re
 import sys
 import threading
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -11,6 +13,9 @@ import requests
 TIMEOUT = 15
 PER_PAGE = 100
 DEFAULT_CONCURRENCY = 10
+DEFAULT_HARVEST_SLEEP = 1.0
+HARVEST_OVERSHOOT_MULT = 3
+HARVEST_OVERSHOOT_BASE = 50
 
 
 def get_config_dir() -> Path:
@@ -22,6 +27,7 @@ KEYS_FILE = CONFIG_DIR / "keys.txt"
 EXCEPTIONS_FILE = CONFIG_DIR / "exceptions.txt"
 BLACKLIST_FILE = CONFIG_DIR / "blacklist.txt"
 CONFIG_FILE = CONFIG_DIR / "config.txt"
+HARVESTED_FILE = CONFIG_DIR / "harvested.txt"
 
 
 def ensure_config_dir() -> None:
@@ -79,6 +85,16 @@ MESSAGES: dict[str, dict[str, str]] = {
         "no_unfollow": "\nNo one to unfollow!\n",
         "following_header": "\n*** Following... ***\n",
         "no_follow": "\nNo one to follow!\n",
+        "harvest_fetching": "Fetching recent candidates from {source}: {target}...",
+        "harvest_found": "Fetched {n} raw candidates, filtering against your follows / blacklist / history...",
+        "harvest_no_candidates": "No eligible candidates found. Try a different source or --limit higher.",
+        "harvest_plan": "\n=== Harvest plan ({source}: {target}) — {n} users ===",
+        "harvest_progress": "  [{i}/{total}] Followed: {name}",
+        "harvest_follow_fail": "  [{i}/{total}] Failed {name} (status {status})",
+        "harvest_rate_limited": "\n⚠ Hit GitHub secondary rate limit. Stopping early to protect your account.",
+        "harvest_summary": "\nDone — followed {followed}, failed {failed}. History recorded in harvested.txt.",
+        "harvest_warn_high": "⚠ Warning: following {n} users in one run may trigger anti-abuse throttling. Consider splitting across days.",
+        "harvest_unknown_source": "Unknown harvest source: {source}. Use 'stargazers' or 'followers'.",
     },
     "ko": {
         "missing_keys": "GitHub 사용자명 또는 토큰을 찾을 수 없습니다. `git-cleaner setup` 을 실행하세요 ({path} 에 직접 생성해도 됩니다)",
@@ -103,6 +119,16 @@ MESSAGES: dict[str, dict[str, str]] = {
         "no_unfollow": "\n언팔로우할 사람이 없습니다!\n",
         "following_header": "\n*** 팔로우 중... ***\n",
         "no_follow": "\n팔로우할 사람이 없습니다!\n",
+        "harvest_fetching": "{source} 에서 최근 후보를 가져오는 중: {target}...",
+        "harvest_found": "원본 후보 {n}명 확보. 내 팔로잉 / 블랙리스트 / 이력 기준으로 필터링 중...",
+        "harvest_no_candidates": "팔로우 가능한 후보가 없습니다. 다른 소스를 시도하거나 --limit 을 늘려보세요.",
+        "harvest_plan": "\n=== Harvest 계획 ({source}: {target}) — {n}명 ===",
+        "harvest_progress": "  [{i}/{total}] 팔로우 완료: {name}",
+        "harvest_follow_fail": "  [{i}/{total}] 실패 — {name} (상태 {status})",
+        "harvest_rate_limited": "\n⚠ GitHub secondary rate limit 에 걸렸습니다. 계정 보호를 위해 조기 종료합니다.",
+        "harvest_summary": "\n완료 — 팔로우 {followed}명, 실패 {failed}명. 이력은 harvested.txt 에 기록되었습니다.",
+        "harvest_warn_high": "⚠ 경고: 한 번에 {n}명 팔로우는 어뷰징 감지에 걸릴 수 있습니다. 며칠에 걸쳐 나눠서 실행하세요.",
+        "harvest_unknown_source": "알 수 없는 harvest 소스: {source}. 'stargazers' 또는 'followers' 중에서 선택하세요.",
     },
 }
 
@@ -188,6 +214,78 @@ def get_all_users(endpoint: str) -> list[dict]:
 def get_user_following(username: str) -> list[str]:
     data = _paginated_get(f"https://api.github.com/users/{username}/following")
     return [u["login"] for u in data]
+
+
+def _parse_last_page(link_header: str) -> int:
+    for part in link_header.split(","):
+        if 'rel="last"' in part:
+            m = re.search(r"[?&]page=(\d+)", part)
+            if m:
+                return int(m.group(1))
+    return 1
+
+
+def _fetch_recent_paginated(base_url: str, limit: int) -> list[str]:
+    """Fetch the most recent entries first by starting from the last page."""
+    first_url = f"{base_url}?per_page={PER_PAGE}&page=1"
+    r = requests.get(first_url, headers=headers, timeout=TIMEOUT)
+    if r.status_code != 200:
+        print(t("api_error", url=first_url, status=r.status_code))
+        return []
+
+    link = r.headers.get("Link", "")
+    last_page = _parse_last_page(link)
+
+    if last_page <= 1:
+        data = r.json()
+        return [u["login"] for u in reversed(data)][:limit]
+
+    users: list[str] = []
+    page = last_page
+    while page >= 1 and len(users) < limit:
+        url = f"{base_url}?per_page={PER_PAGE}&page={page}"
+        resp = requests.get(url, headers=headers, timeout=TIMEOUT)
+        if resp.status_code != 200:
+            print(t("api_error", url=url, status=resp.status_code))
+            break
+        data = resp.json()
+        if not data:
+            break
+        users.extend(u["login"] for u in reversed(data))
+        page -= 1
+    return users[:limit]
+
+
+def fetch_stargazers(repo: str, limit: int) -> list[str]:
+    repo = repo.strip().strip("/")
+    return _fetch_recent_paginated(f"https://api.github.com/repos/{repo}/stargazers", limit)
+
+
+def fetch_user_followers(username: str, limit: int) -> list[str]:
+    username = username.strip().lstrip("@")
+    return _fetch_recent_paginated(f"https://api.github.com/users/{username}/followers", limit)
+
+
+def read_harvested() -> set[str]:
+    if not HARVESTED_FILE.exists():
+        return set()
+    with HARVESTED_FILE.open() as f:
+        return {line.strip() for line in f if line.strip() and not line.startswith("#")}
+
+
+def append_harvested(names: list[str]) -> None:
+    if not names:
+        return
+    with HARVESTED_FILE.open("a") as f:
+        for name in names:
+            f.write(f"{name}\n")
+
+
+def _is_secondary_rate_limit(response: requests.Response) -> bool:
+    if response.status_code not in (403, 429):
+        return False
+    body = (response.text or "").lower()
+    return "secondary rate limit" in body or "abuse" in body
 
 
 def check_rate_limit(required: int) -> bool:
@@ -300,6 +398,91 @@ def run_discover(min_overlap: int, max_follows: int, dry_run: bool, concurrency:
             print(t("follow_failed", name=name, status=r.status_code))
 
 
+def run_harvest(
+    source: str,
+    target: str,
+    limit: int,
+    dry_run: bool,
+    sleep_sec: float,
+) -> None:
+    if limit > 50:
+        print(t("harvest_warn_high", n=limit))
+
+    print(t("harvest_fetching", source=source, target=target))
+    overshoot = limit * HARVEST_OVERSHOOT_MULT + HARVEST_OVERSHOOT_BASE
+
+    if source == "stargazers":
+        raw = fetch_stargazers(target, overshoot)
+    elif source == "followers":
+        raw = fetch_user_followers(target, overshoot)
+    else:
+        print(t("harvest_unknown_source", source=source))
+        return
+
+    if not raw:
+        print(t("harvest_no_candidates"))
+        return
+
+    print(t("harvest_found", n=len(raw)))
+
+    my_following_raw = get_all_users("following")
+    my_following = {u["login"] for u in my_following_raw}
+    harvested = read_harvested()
+    blocked = set(blacklist)
+
+    eligible: list[str] = []
+    seen: set[str] = set()
+    for name in raw:
+        if name in seen:
+            continue
+        seen.add(name)
+        if name == my_username:
+            continue
+        if name in my_following:
+            continue
+        if name in blocked:
+            continue
+        if name in harvested:
+            continue
+        eligible.append(name)
+        if len(eligible) >= limit:
+            break
+
+    if not eligible:
+        print(t("harvest_no_candidates"))
+        return
+
+    print(t("harvest_plan", source=source, target=target, n=len(eligible)))
+    for name in eligible:
+        print(f"  → {name}")
+
+    if dry_run:
+        print(t("dry_run_skip"))
+        return
+
+    followed: list[str] = []
+    failed: list[str] = []
+    total = len(eligible)
+    for i, name in enumerate(eligible, 1):
+        url = f"https://api.github.com/user/following/{name}"
+        r = requests.put(url, headers=headers, timeout=TIMEOUT)
+        if r.status_code == 204:
+            print(t("harvest_progress", i=i, total=total, name=name), flush=True)
+            followed.append(name)
+        elif _is_secondary_rate_limit(r):
+            print(t("harvest_rate_limited"))
+            break
+        else:
+            print(t("harvest_follow_fail", i=i, total=total, name=name, status=r.status_code), flush=True)
+            failed.append(name)
+        if i < total:
+            time.sleep(sleep_sec)
+
+    # Record every attempted name (success or fail) so we don't retry later.
+    append_harvested(followed + failed)
+    print(t("harvest_summary", followed=len(followed), failed=len(failed)))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="git-cleaner")
     sub = parser.add_subparsers(dest="cmd")
@@ -312,10 +495,32 @@ def main() -> None:
     disc.add_argument("--dry-run", action="store_true")
     disc.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
 
+    harvest = sub.add_parser("harvest", help="Harvest followers from a high-value pool")
+    harvest_sub = harvest.add_subparsers(dest="source")
+
+    h_star = harvest_sub.add_parser("stargazers", help="Follow recent stargazers of a repo")
+    h_star.add_argument("--repo", required=True, help="owner/repo, e.g. facebook/react")
+    h_star.add_argument("--limit", type=int, default=20)
+    h_star.add_argument("--sleep", type=float, default=DEFAULT_HARVEST_SLEEP)
+    h_star.add_argument("--dry-run", action="store_true")
+
+    h_fol = harvest_sub.add_parser("followers", help="Follow recent followers of a user")
+    h_fol.add_argument("--user", required=True, help="target username")
+    h_fol.add_argument("--limit", type=int, default=20)
+    h_fol.add_argument("--sleep", type=float, default=DEFAULT_HARVEST_SLEEP)
+    h_fol.add_argument("--dry-run", action="store_true")
+
     args = parser.parse_args()
 
     if args.cmd == "discover":
         run_discover(args.min_overlap, args.max_follows, args.dry_run, args.concurrency)
+    elif args.cmd == "harvest":
+        if args.source == "stargazers":
+            run_harvest("stargazers", args.repo, args.limit, args.dry_run, args.sleep)
+        elif args.source == "followers":
+            run_harvest("followers", args.user, args.limit, args.dry_run, args.sleep)
+        else:
+            harvest.print_help()
     else:
         run_cleanup()
 

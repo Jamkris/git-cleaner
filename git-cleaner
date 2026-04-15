@@ -125,6 +125,14 @@ git-cleaner - GitHub 팔로워/팔로잉 자동 관리 도구
     기본값: --min-overlap 2, --max-follows 20
     처음에는 반드시 --dry-run 으로 후보를 먼저 확인하세요.
 
+  git-cleaner harvest stargazers --repo owner/name [--limit N] [--sleep S] [--dry-run]
+  git-cleaner harvest followers --user USERNAME [--limit N] [--sleep S] [--dry-run]
+    팔로워 성장에 효과적인 소스에서 대상을 직접 수집해 팔로우합니다.
+    - stargazers: 특정 repo 를 최근에 스타한 활성 유저
+    - followers:  특정 유저의 최근 팔로워 (맞팔률 높은 계정 많음)
+    기본값: --limit 20, --sleep 1.0 (초), 하루 50명 이하 권장
+    이력은 ~/.config/git-cleaner/harvested.txt 에 자동 기록되어 재시도 방지됩니다.
+
   git-cleaner -e username1 username2 ...
     예외 목록(exceptions)에 사용자 추가 — 항상 팔로우 상태 유지
 
@@ -161,6 +169,16 @@ Usage:
     Discover and follow users who are followed by people you already follow.
     Defaults: --min-overlap 2, --max-follows 20.
     Use --dry-run first to preview candidates without following.
+
+  git-cleaner harvest stargazers --repo owner/name [--limit N] [--sleep S] [--dry-run]
+  git-cleaner harvest followers --user USERNAME [--limit N] [--sleep S] [--dry-run]
+    Harvest followers from high-value pools (much more effective than discover
+    for growing your follower count):
+    - stargazers: recent stargazers of a given repo (active, topical users)
+    - followers:  recent followers of a given user (often f4f-friendly)
+    Defaults: --limit 20, --sleep 1.0s. Stay under ~50/day to avoid throttling.
+    History is recorded to ~/.config/git-cleaner/harvested.txt to prevent
+    re-attempts across runs.
 
   git-cleaner -e username1 username2 ...
     Add username(s) to exceptions (you will always follow them).
@@ -209,6 +227,14 @@ case "${1:-}" in
     fi
     shift || true
     GIT_CLEANER_LANG="$LANG_CODE" python3 "$PYTHON_SCRIPT" discover "$@"
+    ;;
+  (harvest)
+    if [ ! -f "$PYTHON_SCRIPT" ]; then
+      t no_python_script "$PYTHON_SCRIPT"
+      exit 1
+    fi
+    shift || true
+    GIT_CLEANER_LANG="$LANG_CODE" python3 "$PYTHON_SCRIPT" harvest "$@"
     ;;
   (view)
     ensure_cfg
